@@ -1111,7 +1111,6 @@ def main(args):
                     U_std.flat[i] = np.linalg.norm(std_samp)
                 U_std = U_std.reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
                 plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, z_idx=cfg['grid_size_test']//2, savedir=cfg.get('logdir','./logs'))
-main(args)
 # --------- CLI 실행 ---------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Meta-PINO-AFC 논문 전체 실험 파이프라인")
