@@ -141,7 +141,7 @@ class SoftRegionOperator(nn.Module):
             RegionMLP(in_dim, out_dim),           # 0: MLP
             SimpleFNO3DBlock(in_dim, out_dim),    # 1: FNO
             FFTLinearOperator(in_dim, out_dim),   # 2: FFT
-            PSDTransformerNO(in_dim, out_dim)     # 3: PSD-Transformer-NO ← 여기!
+            PSDTransformerNO(in_dim, out_dim)     # 3: PSD-Transformer-NO
         ])
         
     def forward(self, x, region_feat, grid_shape=None, pde_params=None):
@@ -606,6 +606,12 @@ def custom_collate(data_list):
     batch = Batch.from_data_list(data_list)
     batch.boundary_p_list = [d.boundary_p for d in data_list]
     batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
+    boundary_batches = []
+    for i, d in enumerate(data_list):
+        n_b = d.boundary_coords.shape[0]
+        boundary_batches.append(torch.full((n_b,), i, dtype=torch.long))
+    if boundary_batches:
+        batch.boundary_batch = torch.cat(boundary_batches).to(batch.boundary_coords.device)
     return batch
 
 def mask_boundary_points_3d(coords, xy_range=0.06, z_range=(0.01, 0.07), tol=1e-5):
@@ -665,6 +671,12 @@ def custom_collate(data_list):
     batch = Batch.from_data_list(data_list)
     batch.boundary_p_list = [d.boundary_p for d in data_list]
     batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
+    boundary_batches = []
+    for i, d in enumerate(data_list):
+        n_b = d.boundary_coords.shape[0]
+        boundary_batches.append(torch.full((n_b,), i, dtype=torch.long))
+    if boundary_batches:
+        batch.boundary_batch = torch.cat(boundary_batches).to(batch.boundary_coords.device)
     return batch
 
 # --------- Target Pressure Loss ---------
@@ -960,10 +972,10 @@ def gorkov_potential_torch_3d(p_real, p_imag, vx_r, vy_r, vz_r, vx_i, vy_i, vz_i
     U = (4/3)*np.pi*a**3 * (0.5*f1*p2 - 0.75*f2*rho0*v2)
     return U
 
-def plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, title='Gor’kov U (slice)', z_idx=8, savedir=None):
+def plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, title="Gor'kov U (slice)", z_idx=8, savedir=None):
     plt.figure(figsize=(11,4))
     plt.subplot(1,2,1)
-    plt.title('Mean Gor’kov U')
+    plt.title("Mean Gor'kov U")
     plt.contourf(X[:,:,z_idx], Y[:,:,z_idx], U_mean[:,:,z_idx], levels=50, cmap='viridis')
     plt.colorbar()
     plt.subplot(1,2,2)
