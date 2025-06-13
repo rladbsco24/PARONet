@@ -592,6 +592,7 @@ def build_pyg_data_3d(positions, phases, amplitudes, coords, field, knn=4, devic
     # boundary mask 계산
     mask_b = mask_boundary_points_3d(coords.cpu().numpy(), xy_range=xy_range, z_range=z_range)
     data.boundary_coords = torch.tensor(coords.cpu().numpy()[mask_b], dtype=torch.float32, device=device)
+    data.n_boundary = data.boundary_coords.shape[0]
     arr = field[mask_b, :2] if field.ndim > 1 else field[mask_b]
     if arr.ndim == 1:
         arr = arr[None, :]
@@ -604,7 +605,7 @@ def build_pyg_data_3d(positions, phases, amplitudes, coords, field, knn=4, devic
 def custom_collate(data_list):
     batch = Batch.from_data_list(data_list)
     batch.boundary_p_list = [d.boundary_p for d in data_list]
-    batch.n_boundary_list = [d.n_boundary for d in data_list]
+    batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
     return batch
 
 def mask_boundary_points_3d(coords, xy_range=0.06, z_range=(0.01, 0.07), tol=1e-5):
@@ -661,7 +662,10 @@ def create_synthetic_dataset_3d(
     return data_list
 
 def custom_collate(data_list):
-    return Batch.from_data_list(data_list)
+    batch = Batch.from_data_list(data_list)
+    batch.boundary_p_list = [d.boundary_p for d in data_list]
+    batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
+    return batch
 
 # --------- Target Pressure Loss ---------
 def target_point_loss(model, target_coord, latent):
