@@ -956,10 +956,10 @@ def gorkov_potential_torch_3d(p_real, p_imag, vx_r, vy_r, vz_r, vx_i, vy_i, vz_i
     U = (4/3)*np.pi*a**3 * (0.5*f1*p2 - 0.75*f2*rho0*v2)
     return U
 
-def plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, title='Gor’kov U (slice)', z_idx=8, savedir=None):
+def plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, title="Gor'kov U (slice)", z_idx=8, savedir=None):
     plt.figure(figsize=(11,4))
     plt.subplot(1,2,1)
-    plt.title('Mean Gor’kov U')
+    plt.title("Mean Gor'kov U")
     plt.contourf(X[:,:,z_idx], Y[:,:,z_idx], U_mean[:,:,z_idx], levels=50, cmap='viridis')
     plt.colorbar()
     plt.subplot(1,2,2)
