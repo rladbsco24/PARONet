@@ -606,6 +606,12 @@ def custom_collate(data_list):
     batch = Batch.from_data_list(data_list)
     batch.boundary_p_list = [d.boundary_p for d in data_list]
     batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
+    boundary_batches = []
+    for i, d in enumerate(data_list):
+        n_b = d.boundary_coords.shape[0]
+        boundary_batches.append(torch.full((n_b,), i, dtype=torch.long))
+    if boundary_batches:
+        batch.boundary_batch = torch.cat(boundary_batches).to(batch.boundary_coords.device)
     return batch
 
 def mask_boundary_points_3d(coords, xy_range=0.06, z_range=(0.01, 0.07), tol=1e-5):
@@ -665,6 +671,12 @@ def custom_collate(data_list):
     batch = Batch.from_data_list(data_list)
     batch.boundary_p_list = [d.boundary_p for d in data_list]
     batch.n_boundary_list = [d.boundary_coords.shape[0] for d in data_list]
+    boundary_batches = []
+    for i, d in enumerate(data_list):
+        n_b = d.boundary_coords.shape[0]
+        boundary_batches.append(torch.full((n_b,), i, dtype=torch.long))
+    if boundary_batches:
+        batch.boundary_batch = torch.cat(boundary_batches).to(batch.boundary_coords.device)
     return batch
 
 # --------- Target Pressure Loss ---------
