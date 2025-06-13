@@ -13,6 +13,14 @@ from torch_geometric.nn import SAGEConv, global_mean_pool, knn_graph
 import matplotlib.pyplot as plt
 from torch_geometric.data import Batch
 
+os.environ["PYTORCH_ENABLE_FLASH_ATTENTION"] = "0"
+os.environ["PYTORCH_ENABLE_MEM_EFFICIENT_ATTENTION"] = "0"
+os.environ["PYTORCH_ENABLE_SDPA"] = "0"
+os.environ["PYTORCH_USE_CUDA_DSA"] = "0"  # DSA(Direct Storage Attention) 비활성화
+
+REGION_OPS = ['fft', 'fno', 'mlp', 'psdtrans']
+N_REGION = len(REGION_OPS)
+
 # --------- 환경/seed reproducibility ---------
 def set_seed(seed):
     random.seed(seed)
@@ -35,6 +43,37 @@ def load_config(config_path):
         print(f"[ERROR] Failed to load config file: {e}")
         return None
 
+def parse_config(cfg):
+    """config.yaml에서 읽은 딕셔너리 cfg를 안전하게 형변환/검증."""
+    # 숫자
+    float_keys = [
+        'amp_base', 'xy_range', 'boundary_tol', 'target_radius', 'k', 'lr', 'dropout_p'
+    ]
+    int_keys = [
+        'seed', 'n_train', 'n_test', 'n_transducers', 'grid_size_train', 'grid_size_test',
+        'ffm_dim', 'gnn_dim', 'latent_dim', 'dec_dim', 'epochs', 'batch_size', 'n_mc'
+    ]
+    list_keys = [
+        'ffm_scales'
+    ]
+    tuple_keys = [
+        'target_coord', 'z_range'
+    ]
+    for k in float_keys:
+        if k in cfg:
+            cfg[k] = float(cfg[k])
+    for k in int_keys:
+        if k in cfg:
+            cfg[k] = int(cfg[k])
+    for k in list_keys:
+        if k in cfg and isinstance(cfg[k], str):
+            # "1, 5, 10" -> [1, 5, 10]
+            cfg[k] = [int(s.strip()) for s in cfg[k].strip('[]').split(',')]
+    for k in tuple_keys:
+        if k in cfg and isinstance(cfg[k], str):
+            cfg[k] = tuple(float(s.strip()) for s in cfg[k].strip('[]()').split(','))
+    return cfg
+    
 class Args:
     config = "config.yaml"
     train = True
@@ -79,12 +118,17 @@ def to_complex(tensor):
 class FFTLinearOperator(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
         self.kernel = nn.Parameter(torch.randn(out_dim, in_dim, dtype=torch.cfloat) * 0.01)
     def forward(self, x):
-        x_c = torch.complex(x, torch.zeros_like(x))
-        x_fft = torch.fft.fft(x_c, dim=1)
-        x_out = torch.fft.ifft(x_fft * self.kernel, dim=1)
-        return torch.view_as_real(x_out)[..., 0]  # 복소수 실수부(혹은 그대로 complex로 써도 됨)
+        # x: (N, in_dim)
+        x_c = torch.complex(x, torch.zeros_like(x)) if not torch.is_complex(x) else x
+        x_fft = torch.fft.fft(x_c, dim=1)  # (N, in_dim)
+        # (N, in_dim) @ (in_dim, out_dim) = (N, out_dim)
+        x_fft_out = x_fft @ self.kernel.t()  # (N, out_dim)
+        x_out = torch.fft.ifft(x_fft_out, dim=1)  # (N, out_dim)
+        return torch.view_as_real(x_out)[..., 0]  # (N, out_dim)
 
 class SoftRegionOperator(nn.Module):
     def __init__(self, in_dim, out_dim, n_ops=3):
@@ -94,24 +138,83 @@ class SoftRegionOperator(nn.Module):
             nn.Linear(n_ops, 32), nn.ReLU(), nn.Linear(32, n_ops)
         )
         self.operators = nn.ModuleList([
-            RegionMLP(in_dim, out_dim),       # 0: MLP
-            SimpleFNO3DBlock(in_dim, out_dim),# 1: FNO
-            FFTLinearOperator(in_dim, out_dim)# 2: FFT
+            RegionMLP(in_dim, out_dim),           # 0: MLP
+            SimpleFNO3DBlock(in_dim, out_dim),    # 1: FNO
+            FFTLinearOperator(in_dim, out_dim),   # 2: FFT
+            PSDTransformerNO(in_dim, out_dim)     # 3: PSD-Transformer-NO ← 여기!
         ])
-    def forward(self, x, region_feat, grid_shape=None):
-        op_logits = self.op_selector(region_feat)   # (N, n_ops)
+        
+    def forward(self, x, region_feat, grid_shape=None, pde_params=None):
+        op_logits = self.op_selector(region_feat)
         op_weights = torch.softmax(op_logits, dim=-1)
         outs = []
         for i, op in enumerate(self.operators):
-            # FNO만 grid_shape 필요
-            if isinstance(op, SimpleFNO3DBlock) and grid_shape is not None:
-                outs.append(op(x, grid_shape))
+            # FNO/FFT: grid_shape 있는 경우에만
+            if i in [1,2] and (grid_shape is not None):
+                # x와 grid_shape가 일치하는 경우에만!
+                expected_N = np.prod(grid_shape)
+                if x.shape[0] == expected_N:
+                    if i == 1:
+                        outs.append(op(x, grid_shape))
+                    elif i == 2:
+                        outs.append(op(x))
+                    continue
+                else:
+                    # shape 안맞으면 dummy output
+                    outs.append(torch.zeros(x.shape[0], op.out_dim, device=x.device, dtype=x.dtype))
+                    continue
+            # PSDTransformer: grid_shape 있는 경우만 pde_params와 같이 사용
+            elif i == 3 and (grid_shape is not None) and (pde_params is not None) and (x.shape[0] == np.prod(grid_shape)):
+                outs.append(op(x, pde_params=pde_params, grid_shape=grid_shape))
+                continue
             else:
-                outs.append(op(x))
-        outs = torch.stack(outs, dim=-1)           # (N, out_dim, n_ops)
-        out = (op_weights.unsqueeze(1) * outs).sum(dim=-1)  # (N, out_dim)
+                outs.append(op(x))  # MLP or fallback
+        outs = torch.stack(outs, dim=-1)
+        out = (op_weights.unsqueeze(1) * outs).sum(dim=-1)
         return out
+    
+class SimpleSelfAttention(nn.Module):
+    def __init__(self, embed_dim, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.embed_dim = embed_dim
+        assert embed_dim % n_heads == 0
+        self.head_dim = embed_dim // n_heads
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
 
+    def forward(self, x):
+        # x: (B, N, embed_dim)
+        B, N, D = x.shape
+        qkv = self.qkv_proj(x)  # (B, N, 3*D)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # Split heads
+        q = q.view(B, N, self.n_heads, self.head_dim).transpose(1,2)  # (B, nH, N, dH)
+        k = k.view(B, N, self.n_heads, self.head_dim).transpose(1,2)
+        v = v.view(B, N, self.n_heads, self.head_dim).transpose(1,2)
+        # Attention score
+        attn_score = torch.matmul(q, k.transpose(-2,-1)) / (self.head_dim**0.5)  # (B, nH, N, N)
+        attn = F.softmax(attn_score, dim=-1)
+        out = torch.matmul(attn, v) # (B, nH, N, dH)
+        out = out.transpose(1,2).contiguous().view(B, N, D)
+        return self.out_proj(out)
+
+class CustomTransformerBlock(nn.Module):
+    def __init__(self, embed_dim, n_heads, mlp_ratio=4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = SimpleSelfAttention(embed_dim, n_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim*mlp_ratio),
+            nn.GELU(),
+            nn.Linear(embed_dim*mlp_ratio, embed_dim)
+        )
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+    
 class MultiScaleFourierEncoder(nn.Module):
     def __init__(self, input_dim, scales, out_dim):
         super().__init__()
@@ -162,6 +265,7 @@ class RegionMLP(nn.Module):
             nn.Linear(64, 64), nn.ReLU(),
             nn.Linear(64, out_dim)
         )
+        self.out_dim = out_dim
     def forward(self, x):
         return self.net(x)
 
@@ -169,29 +273,23 @@ class SimpleFNO3DBlock(nn.Module):
     def __init__(self, in_channels, out_channels, modes=8, width=32, n_layers=4):
         super().__init__()
         self.width = width
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-        self.n_layers = n_layers
-
         self.input_proj = nn.Linear(in_channels, width)
         self.fno_layers = nn.ModuleList([
             FNO3DLayer(width, width, modes) for _ in range(n_layers)
         ])
         self.output_proj = nn.Linear(width, out_channels)
         self.activation = nn.GELU()
+        self.out_dim = out_channels
 
     def forward(self, x, grid_shape):
-        # x: (N, in_channels), grid_shape: (nx, ny, nz)
         N = x.size(0)
-        x = self.input_proj(x)
-        # Reshape to 3D grid: (nx, ny, nz, width)
-        x = x.view(*grid_shape, self.width).permute(3,0,1,2).unsqueeze(0)  # (B=1, C, nx, ny, nz)
+        x = self.input_proj(x)  # (N, width)
+        x = x.view(*grid_shape, self.width).permute(3,0,1,2).unsqueeze(0)  # (1, width, nx, ny, nz)
         for layer in self.fno_layers:
             x = self.activation(layer(x))
         x = x.permute(0,2,3,4,1).reshape(N, self.width)
         x = self.output_proj(x)
-        return x  # (N, out_channels)
+        return x
 
 class FNO3DLayer(nn.Module):
     def __init__(self, in_channels, out_channels, modes):
@@ -199,27 +297,89 @@ class FNO3DLayer(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes = modes
-        # Spectral weights
-        self.weight = nn.Parameter(torch.randn(
-            in_channels, out_channels, modes, modes, modes, dtype=torch.cfloat
-        ) * 0.01)
-        # Local mixing
         self.w_local = nn.Conv3d(in_channels, out_channels, 1)
+        self.weight = nn.Parameter(
+            torch.randn(
+                in_channels, out_channels,
+                modes, modes, modes,
+                dtype=torch.cfloat
+            ) * 0.01
+        )
 
     def forward(self, x):
-        # x: (B, C, nx, ny, nz)
         B, C, nx, ny, nz = x.shape
+        modes_x = min(self.modes, nx)
+        modes_y = min(self.modes, ny)
+        modes_z = nz // 2 + 1
+        modes_z_eff = min(self.modes, modes_z)
+
         x_ft = torch.fft.rfftn(x, s=(nx, ny, nz), dim=[2,3,4])
-        # Only keep low freq modes
-        out_ft = torch.zeros(B, self.out_channels, nx, ny, nz//2+1, dtype=torch.cfloat, device=x.device)
-        out_ft[:,:,:self.modes,:self.modes,:self.modes] = torch.einsum(
-            "bci...,...oijk->bcoijk", x_ft[:,:,:self.modes,:self.modes,:self.modes], self.weight
+        # 디버그 출력
+        print(f"x_ft.shape: {x_ft.shape}")
+        print(f"weight.shape (slice): {self.weight[:, :, :modes_x, :modes_y, :modes_z_eff].shape}")
+
+        # 슬라이스를 명확히 맞추기
+        x_ft_cut = x_ft[:, :, :modes_x, :modes_y, :modes_z_eff]          # (B, C, mx, my, mz)
+        weight_cut = self.weight[:, :, :modes_x, :modes_y, :modes_z_eff] # (C, O, mx, my, mz)
+
+        # einsum: (B, C, mx, my, mz), (C, O, mx, my, mz) → (B, O, mx, my, mz)
+        out_ft = torch.zeros(B, self.out_channels, nx, ny, modes_z, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :modes_x, :modes_y, :modes_z_eff] = torch.einsum(
+            "bcmxy,comxy->bomxy", x_ft_cut, weight_cut
         )
         x_ifft = torch.fft.irfftn(out_ft, s=(nx, ny, nz), dim=[2,3,4])
-        # Add local convolution
         x_local = self.w_local(x)
         return x_ifft + x_local
+    
+class PSDTransformerNO(nn.Module):
+    def __init__(self, in_dim, out_dim, patch_size=8, n_heads=4, n_layers=4, pde_param_dim=1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = in_dim
+        self.out_dim = out_dim
+        self.n_heads = n_heads
+        self.pde_param_dim = pde_param_dim
+        self.n_layers = n_layers
 
+        self.patch_embed = nn.Linear(in_dim, self.embed_dim)
+        self.pde_mlp = nn.Linear(self.pde_param_dim, self.embed_dim)
+        self.transformer_blocks = nn.ModuleList([
+            CustomTransformerBlock(self.embed_dim, n_heads) for _ in range(n_layers)
+        ])
+        self.out_proj = nn.Linear(self.embed_dim, out_dim)
+
+    def forward(self, x, pde_params=None, grid_shape=None):
+        N, in_dim = x.shape
+        # 3D grid화
+        if grid_shape is not None:
+            nx, ny, nz = grid_shape
+            try:
+                x = x.view(nx, ny, nz, in_dim)
+                x = x.view(-1, in_dim)
+            except Exception as e:
+                print(f"[PSDTransformerNO] grid_shape reshape 실패: {e}, fallback to flat")
+                pass
+
+        patches = self.patch_embed(x)  # (N, embed_dim)
+        # PDE 파라미터 embedding
+        if pde_params is not None:
+            if len(pde_params.shape) == 1:
+                pde_params = pde_params.unsqueeze(0)
+            pde_feat = self.pde_mlp(pde_params)
+            if pde_feat.shape[0] == 1:
+                pde_feat = pde_feat.expand_as(patches)
+            elif pde_feat.shape[0] != patches.shape[0]:
+                pde_feat = pde_feat.repeat(patches.shape[0], 1)
+            patches = patches + pde_feat
+        patches = patches.unsqueeze(0)  # (B=1, N, embed_dim)
+
+        y = patches
+        for block in self.transformer_blocks:
+            y = block(y)
+        y = self.out_proj(y)
+        y = y.squeeze(0)  # (N, out_dim)
+        return y
+    
 # --------- Neural Operator Decoder (with UQ) ---------
 class ComplexDropout(nn.Module):
     def __init__(self, p=0.2):
@@ -239,10 +399,10 @@ class PARONet_Decoder(nn.Module):
         self.dropout = ComplexDropout(dropout_p)
         self.bias = nn.Parameter(torch.zeros(out_dim, dtype=torch.cfloat))
         self.region_params = region_params
-        self.soft_operator = SoftRegionOperator(latent_dim*2, out_dim, n_ops=3)
-        self.n_ops = 3
+        self.soft_operator = SoftRegionOperator(latent_dim*2, out_dim, n_ops=4)
+        self.n_ops = 4
 
-    def forward(self, coords, latent):
+    def forward(self, coords, latent, for_boundary=False):
         coords = coords.float()
         coord_feat = self.coord_layer(coords)
         latent_rep = latent.repeat_interleave(coords.shape[0] // latent.shape[0], dim=0)
@@ -257,14 +417,35 @@ class PARONet_Decoder(nn.Module):
         )
         region_feat = F.one_hot(region_mask, num_classes=self.n_ops).float()  # (N, n_ops)
 
-        # ---- grid_shape 추정 ----
-        # 예: 전체 query point 개수 == n_grid^3 일 때
-        region_len = coords.shape[0]
-        grid_size = int(round(region_len ** (1/3)))
-        grid_shape = (grid_size, grid_size, grid_size)
+        if not for_boundary:
+            # ------ region별 pde_params 생성 -------
+            k_bg = 730.0
+            k_target = 750.0
+            k_boundary = 720.0
+            region_pde_params = {
+                0: torch.tensor([[k_bg]], device=coords.device),
+                1: torch.tensor([[k_target]], device=coords.device),
+                2: torch.tensor([[k_boundary]], device=coords.device),
+            }
+            pde_params_all = torch.zeros(coords.shape[0], 1, device=coords.device)  # (N, 1)
+            for reg_idx, pde_param in region_pde_params.items():
+                idxs = (region_mask == reg_idx)
+                pde_params_all[idxs] = pde_param  # broadcasting
 
-        # soft_operator에 grid_shape 전달
-        out = self.soft_operator(combined, region_feat, grid_shape=grid_shape)
+            # grid_shape 추정
+            region_len = coords.shape[0]
+            grid_size = int(round(region_len ** (1/3)))
+            grid_shape = (grid_size, grid_size, grid_size)
+
+            out = self.soft_operator(
+                combined, region_feat, grid_shape=grid_shape, pde_params=pde_params_all
+            )
+        else:
+            # boundary, bc 등 irregular → grid_shape/pde_params X
+            out = self.soft_operator(
+                combined, region_feat, grid_shape=None, pde_params=None
+            )
+
         out = out + self.bias
         out = self.dropout(out)
         return out
@@ -312,7 +493,8 @@ class ComplexSKPDELayer(nn.Module):
         helm_res = lap_p + (self.k**2) * p_val
         loss_pde = complex_mse_loss(helm_res, torch.zeros_like(helm_res))
 
-        pred_bc = model.decoder(coords_bc.type(torch.cfloat), latent)
+        # Boundary loss 계산
+        pred_bc = model.decoder(batch.boundary_coords.float(), latent, for_boundary=True)
         bc_val = pred_bc[:, 0]
         loss_bc = complex_mse_loss(bc_val, gt_bc.type(torch.cfloat)[:, 0])
         return loss_pde, loss_bc, helm_res.detach()
@@ -391,7 +573,7 @@ def synthesize_pressure_and_velocity_3d(positions, phases, amplitudes, coords,
     out = np.concatenate([p_real[:,None], p_imag[:,None], v_real, v_imag], axis=1)
     return out
 
-def build_pyg_data_3d(positions, phases, amplitudes, coords, field, knn=4, device='cpu'):
+def build_pyg_data_3d(positions, phases, amplitudes, coords, field, knn=4, device='cpu', xy_range=0.06, z_range=(0.01, 0.07)):
     positions = torch.tensor(positions, dtype=torch.float32, device=device)
     phases = torch.tensor(phases, dtype=torch.float32, device=device)
     amplitudes = torch.tensor(amplitudes, dtype=torch.float32, device=device)
@@ -404,10 +586,26 @@ def build_pyg_data_3d(positions, phases, amplitudes, coords, field, knn=4, devic
     edge_index = knn_graph(positions, k=knn)
     coords = torch.tensor(coords, dtype=torch.float32, device=device)
     y = torch.tensor(field, dtype=torch.float32, device=device) # (N, 8)
-    # → coords_batch은 data 생성 시 0으로 설정 (단일 그래프 기준)
     coords_batch = torch.zeros(coords.shape[0], dtype=torch.long, device=device)
     data = Data(x=node_feat, edge_index=edge_index, coords=coords, y=y, coords_batch=coords_batch)
+
+    # boundary mask 계산
+    mask_b = mask_boundary_points_3d(coords.cpu().numpy(), xy_range=xy_range, z_range=z_range)
+    data.boundary_coords = torch.tensor(coords.cpu().numpy()[mask_b], dtype=torch.float32, device=device)
+    arr = field[mask_b, :2] if field.ndim > 1 else field[mask_b]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    data.boundary_p = torch.tensor(arr, dtype=torch.float32, device=device)
+    # ----------- 반드시 추가! -----------
+    # batch내 index 0부터 시작
+    data.boundary_batch = torch.zeros(data.boundary_coords.shape[0], dtype=torch.long, device=device)
     return data
+
+def custom_collate(data_list):
+    batch = Batch.from_data_list(data_list)
+    batch.boundary_p_list = [d.boundary_p for d in data_list]
+    batch.n_boundary_list = [d.n_boundary for d in data_list]
+    return batch
 
 def mask_boundary_points_3d(coords, xy_range=0.06, z_range=(0.01, 0.07), tol=1e-5):
     mask = (
@@ -434,6 +632,7 @@ def create_synthetic_dataset_3d(
         )
         coords, _, _, _ = sample_query_points_3d(grid_size, xy_range, z_range)
         field = synthesize_pressure_and_velocity_3d(positions, phases, amplitudes, coords)
+        mask_b = mask_boundary_points_3d(coords, xy_range, z_range)
         data = build_pyg_data_3d(positions, phases, amplitudes, coords, field, device=device)
         mask_b = mask_boundary_points_3d(coords, xy_range, z_range)
         data.mask_boundary = torch.tensor(mask_b, dtype=torch.bool, device=device)
@@ -453,7 +652,11 @@ def create_synthetic_dataset_3d(
         data.z_range = z_range
         data.grid_size = grid_size
         data.boundary_coords = torch.tensor(coords[mask_b], dtype=torch.float32, device=device)
-        data.boundary_p = torch.tensor(field[mask_b, :2], dtype=torch.float32, device=device)
+        arr = field[mask_b, :2]
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        assert arr.ndim == 2 and arr.shape[1] == 2, f"boundary_p shape error: {arr.shape}"
+        data.boundary_p = torch.tensor(arr, dtype=torch.float32, device=device)
         data_list.append(data)
     return data_list
 
@@ -534,18 +737,68 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
             region_operator_config = agent.select_operators()
             model.decoder.region_operator_config = region_operator_config
         for batch in train_loader:
+            batch = batch.to(device)
             pred = model(batch)  # (총 쿼리 수, 8)
             n_graphs = int(batch.coords_batch.max().item()) + 1
             loss_pressure = 0.0
             loss_velocity = 0.0
+            loss_bc_total = 0.0
+
             for i in range(n_graphs):
                 idx = (batch.coords_batch == i)
                 pred_i = pred[idx]
                 y_i = batch.y[idx]
-                y_cpx_i = torch.complex(y_i[:,0], y_i[:,1])
-                y_real_i = y_i[:,2:]
-                loss_pressure += complex_mse_loss(pred_i[:,0], y_cpx_i)
-                loss_velocity += F.mse_loss(pred_i[:,2:].real, y_real_i)
+
+                # boundary 부분: 슬라이스 방식으로 변경
+                boundary_p = batch.boundary_p         # (전체 boundary point, 2)
+                mask_boundary = (batch.boundary_batch == i)
+                if mask_boundary.sum() == 0:
+                    continue  # 해당 그래프에는 boundary가 없음, 스킵
+        
+                boundary_coords_i = batch.boundary_coords[mask_boundary]
+                boundary_p_i = boundary_p[mask_boundary]
+                if boundary_p_i.dim() == 1:
+                    raise ValueError(f"boundary_p_i shape is 1D: {boundary_p_i.shape}")
+
+                if y_i.dim() == 1:
+                    y_i = y_i.unsqueeze(0)
+                if pred_i.dim() == 1:
+                    pred_i = pred_i.unsqueeze(0)
+
+                boundary_p_i = boundary_p[mask_boundary]
+                if boundary_p_i.dim() == 1:
+                    print(f"[Info] boundary_p_i shape 1D detected. Unsqueezing: {boundary_p_i.shape}")
+                    boundary_p_i = boundary_p_i.unsqueeze(0)
+                assert boundary_p_i.dim() == 2 and boundary_p_i.shape[1] == 2, f"boundary_p_i shape error: {boundary_p_i.shape}"
+
+                # Pressure loss
+                if torch.is_complex(y_i):
+                    y_cpx_i = y_i[:, 0]
+                else:
+                    y_cpx_i = torch.complex(y_i[:, 0], y_i[:, 1])
+                loss_pressure += complex_mse_loss(pred_i[:, 0], y_cpx_i)
+
+                # Velocity loss (ONLY REAL PART, .float())
+                y_real_i = y_i[:, 2:8].float()                  # (M, 6) float
+                pred_real_i = pred_i[:, 2:8].real.float()       # (M, 6) float
+
+                print("pred_real_i.shape:", pred_real_i.shape, pred_real_i.dtype)
+                print("y_real_i.shape:", y_real_i.shape, y_real_i.dtype)
+                loss_velocity += F.mse_loss(pred_real_i, y_real_i)
+
+                # --- Boundary loss per graph ---
+                latent = model.encoder(
+                    batch.x, batch.edge_index, batch.x[:, :3],
+                    torch.zeros(batch.x.size(0), dtype=torch.long, device=device)
+                )
+                pred_bc = model.decoder(boundary_coords_i.float(), latent, for_boundary=True)
+                bc_val_real_imag = torch.view_as_real(pred_bc[:, 0])
+                bc_real = bc_val_real_imag[:, 0]
+                bc_imag = bc_val_real_imag[:, 1]
+                bc_pred = torch.complex(bc_real, bc_imag)
+                bc_true = torch.complex(boundary_p[:, 0], boundary_p[:, 1]).to(device)
+                loss_bc = complex_mse_loss(bc_pred, bc_true)
+                loss_bc_total += loss_bc
             loss_pressure /= n_graphs
             loss_velocity /= n_graphs
             loss_data = loss_pressure + loss_velocity
@@ -606,7 +859,11 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
             bc_real = bc_val_real_imag[:, 0]
             bc_imag = bc_val_real_imag[:, 1]
             bc_pred = torch.complex(bc_real, bc_imag)
-            bc_true = torch.complex(batch.boundary_p[:, 0], batch.boundary_p[:, 1]).to(device)
+            boundary_p = batch.boundary_p
+            print(f"boundary_p shape: {boundary_p.shape}")
+            if boundary_p.dim() == 1:
+                raise ValueError(f"boundary_p shape is 1D: {boundary_p.shape}. Check data generation.")
+            bc_true = torch.complex(boundary_p[:, 0], boundary_p[:, 1]).to(device)
             loss_bc = complex_mse_loss(bc_pred, bc_true)
 
             # 목표 좌표 압력 loss 계산
@@ -719,6 +976,10 @@ def plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, title='Gor’kov U (slice)', z_
 def main(args):
     # 1. 환경설정 및 config 로드
     cfg = load_config(args.config)
+    if cfg is None:
+        print("[Fatal] config 파싱 실패. 실행 중단.")
+        exit(1)
+    cfg = parse_config(cfg)
     set_seed(cfg.get("seed", 42))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
@@ -736,7 +997,7 @@ def main(args):
     all_y = np.vstack([d.y_np for d in train_data])
     y_mean = all_y.mean(axis=0)
     y_std = all_y.std(axis=0) + 1e-8
-    agent = RegionOpRLAgent(ops=['fft','fno','mlp'], n_regions=3, epsilon=0.2)
+    agent = RegionOpRLAgent(ops=['fft','fno','mlp','psdtrans'], n_regions=4, epsilon=0.2)
     for d in train_data:
         d.y = to_complex(d.y.cpu().numpy())
         d.boundary_p = to_complex(d.boundary_p.cpu().numpy())
@@ -790,7 +1051,7 @@ def main(args):
     # AcousticPINO3D_UQ에 region_params 전달!
     # ----------- target_coord 정의 먼저! -----------
     target_coord = cfg.get('target_coord', [0.0, 0.0, 0.04])
-    region_operator_config = {0: 'fft', 1: 'fno', 2: 'mlp'}
+    region_operator_config = {0: 'fft', 1: 'fno', 2: 'mlp', 3: 'psdtrans'}
     model = AcousticPINO3D_UQ(
         in_dim=6, ffm_scales=cfg['ffm_scales'], ffm_dim=cfg['ffm_dim'], gnn_dim=cfg['gnn_dim'],
         dec_dim=cfg['dec_dim'], out_dim=8, dropout_p=cfg['dropout_p'],
