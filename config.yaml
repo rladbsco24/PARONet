@@ -1,0 +1,36 @@
+seed: 42
+n_train: 96
+n_test: 2
+n_transducers: 64
+grid_size_train: 9
+grid_size_test: 17
+amp_base: 50.0
+batch_size: 1
+ffm_dim: 128
+ffm_scales: [1, 5, 10, 30]
+gnn_dim: 1024
+latent_dim: 256
+dec_dim: 512
+dropout_p: 0.2
+epochs: 5000
+lr: 0.001
+w_pde: 10.0
+w_bc: 1.0
+w_target: 1.0
+w_target_region: 1.0
+w_boundary_region: 1.0
+w_background_region: 1.0
+w_grad_penalty: 1.0
+n_mc: 32
+logdir: ./logs
+target_coord: [0.0, 0.0, 0.04]
+k: 730.9649562110277
+target_radius: 0.005
+boundary_tol: 1e-5
+xy_range: 0.06
+z_range: [0.01, 0.07]
+region_operator_config:
+  0: fft
+  1: fno
+  2: mlp
+  3: psdtrans
