@@ -130,48 +130,119 @@ class FFTLinearOperator(nn.Module):
         x_out = torch.fft.ifft(x_fft_out, dim=1)  # (N, out_dim)
         return torch.view_as_real(x_out)[..., 0]  # (N, out_dim)
 
-class SoftRegionOperator(nn.Module):
-    def __init__(self, in_dim, out_dim, n_ops=3):
+# =========================================================================================
+# 1. SoftRegionOperator 클래스를 아래 PARONetOperatorSelector 클래스로 대체
+# =========================================================================================
+class PARONetOperatorSelector(nn.Module):
+    """
+    강화학습 에이전트 또는 설정에 따라 지역별로 지정된 단일 연산자(Operator)를
+    선택하고 적용하는 '하드 셀렉터(Hard Selector)' 모듈.
+    """
+    def __init__(self, in_dim, out_dim, n_ops=4):
         super().__init__()
-        self.n_ops = n_ops
-        self.op_selector = nn.Sequential(
-            nn.Linear(n_ops, 32), nn.ReLU(), nn.Linear(32, n_ops)
-        )
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        
+        # 사용 가능한 모든 운영자들을 ModuleList에 등록
         self.operators = nn.ModuleList([
-            RegionMLP(in_dim, out_dim),           # 0: MLP
-            SimpleFNO3DBlock(in_dim, out_dim),    # 1: FNO
-            FFTLinearOperator(in_dim, out_dim),   # 2: FFT
-            PSDTransformerNO(in_dim, out_dim)     # 3: PSD-Transformer-NO
+            RegionMLP(in_dim, out_dim),           # 0: 'mlp'
+            SimpleFNO3DBlock(in_dim, out_dim),    # 1: 'fno'
+            FFTLinearOperator(in_dim, out_dim),   # 2: 'fft'
+            PSDTransformerNO(in_dim, out_dim)     # 3: 'psdtrans'
         ])
         
-    def forward(self, x, region_feat, grid_shape=None, pde_params=None):
-        op_logits = self.op_selector(region_feat)
-        op_weights = torch.softmax(op_logits, dim=-1)
-        outs = []
-        for i, op in enumerate(self.operators):
-            # FNO/FFT: grid_shape 있는 경우에만
-            if i in [1,2] and (grid_shape is not None):
-                # x와 grid_shape가 일치하는 경우에만!
-                expected_N = np.prod(grid_shape)
-                if x.shape[0] == expected_N:
-                    if i == 1:
-                        outs.append(op(x, grid_shape))
-                    elif i == 2:
-                        outs.append(op(x))
-                    continue
-                else:
-                    # shape 안맞으면 dummy output
-                    outs.append(torch.zeros(x.shape[0], op.out_dim, device=x.device, dtype=x.dtype))
-                    continue
-            # PSDTransformer: grid_shape 있는 경우만 pde_params와 같이 사용
-            elif i == 3 and (grid_shape is not None) and (pde_params is not None) and (x.shape[0] == np.prod(grid_shape)):
-                outs.append(op(x, pde_params=pde_params, grid_shape=grid_shape))
+        # 운영자 이름(str)을 ModuleList의 인덱스(int)로 변환하기 위한 맵
+        self.op_name_to_idx = {'mlp': 0, 'fno': 1, 'fft': 2, 'psdtrans': 3}
+
+    def forward(self, x, coords, pde_params, op_config, region_params):
+        """
+        Args:
+            x (Tensor): 입력 피처 (N, in_dim)
+            coords (Tensor): 쿼리 포인트 좌표 (N, 3)
+            pde_params (Tensor): 각 포인트에 매핑된 PDE 파라미터 (N, pde_dim)
+            op_config (dict): RL 에이전트가 선택한 지역-운영자 매핑. 예: {0: 'fft', 1: 'fno', 2: 'mlp'}
+            region_params (dict): 지역 마스크 생성을 위한 파라미터 딕셔너리.
+        """
+        # op_config가 없으면, 가장 간단한 MLP를 기본 운영자로 사용 (Fallback)
+        if op_config is None:
+            return self.operators[0](x)
+
+        # 1. 입력 좌표를 기반으로 각 포인트의 지역(region)을 결정하는 마스크 생성
+        region_mask = get_region_mask(
+            coords,
+            target_region_center=region_params['target_center'],
+            target_radius=region_params['target_radius'],
+            boundary_range=region_params['boundary_tol'],
+            xy_range=region_params['xy_range'],
+            z_range=region_params['z_range'],
+        )
+
+        # 2. 최종 출력을 담을 텐서 초기화
+        outputs = torch.zeros(x.shape[0], self.out_dim, device=x.device, dtype=torch.float32)
+        
+        # 입력 x를 복소수로 변환 (필요시)
+        if not torch.is_complex(x):
+            x = torch.complex(x, torch.zeros_like(x))
+
+        # 3. 각 지역별로 루프를 돌며 선택된 운영자를 적용
+        for region_idx, op_name in op_config.items():
+            # 현재 지역에 해당하는 포인트들의 마스크
+            mask = (region_mask == region_idx)
+            
+            # 해당 지역에 포인트가 없으면 다음 지역으로
+            if not torch.any(mask):
                 continue
+            
+            # 선택된 운영자 인스턴스 가져오기
+            op_idx = self.op_name_to_idx[op_name]
+            op = self.operators[op_idx]
+
+            # 운영자별 입력 조건에 맞게 호출
+            # FNO와 PSDTransformer는 전체가 정규 격자(grid)일 때 가장 잘 작동합니다.
+            # 포인트의 일부만 마스킹된 비정규적 데이터에 대해서는 한계가 있을 수 있으므로,
+            # 이 경우 가장 강건한 MLP로 대체(fallback)하는 것이 안정적일 수 있습니다.
+            # 여기서는 구현의 편의를 위해 일단 그대로 적용합니다.
+            
+            x_masked = x[mask]
+            
+            if op_name == 'fno':
+                # FNO는 grid_shape이 필요. 마스킹된 데이터는 정확한 grid를 형성하지 못할 수 있음.
+                # 전체 데이터가 하나의 지역일 때 가장 잘 작동함.
+                grid_size_approx = int(round(x_masked.shape[0] ** (1/3)))
+                grid_shape_approx = (grid_size_approx, grid_size_approx, grid_size_approx)
+                if np.prod(grid_shape_approx) == x_masked.shape[0]:
+                    result = op(x_masked, grid_shape_approx)
+                else:
+                    # 격자 형성이 안되면 MLP로 대체
+                    result = self.operators[0](x_masked)
+
+            elif op_name == 'psdtrans':
+                pde_params_masked = pde_params[mask]
+                result = op(x_masked, pde_params=pde_params_masked)
+
+            else: # 'mlp' 또는 'fft' (포인트별 연산)
+                result = op(x_masked)
+
+            # 연산 결과를 최종 출력 텐서의 해당 위치에 저장
+            # 결과가 복소수일 경우 실수부만 취하거나, out_dim에 맞게 처리 필요.
+            # 여기서는 out_dim이 8(실수)이라고 가정하고, 복소수 결과는 실수/허수부로 분리.
+            if torch.is_complex(result):
+                # 예: p_real, p_imag, v_real, v_imag...
+                # out_dim이 8이므로 (N, 4) 복소수 또는 (N, 8) 실수가 나와야 함
+                # 간단하게 실수부만 취하거나, 복소수를 실수로 변환
+                # 아래는 out_dim=8을 가정하고 real/imag을 합치는 예시
+                if result.shape[-1] * 2 == self.out_dim:
+                     outputs[mask] = torch.cat([result.real, result.imag], dim=-1)
+                else: # 차원이 안맞으면 실수부만 사용
+                     outputs[mask] = result.real
             else:
-                outs.append(op(x))  # MLP or fallback
-        outs = torch.stack(outs, dim=-1)
-        out = (op_weights.unsqueeze(1) * outs).sum(dim=-1)
-        return out
+                 outputs[mask] = result
+
+        # PARONet_Decoder는 복소수 출력을 기대하므로, 최종 결과를 복소수로 변환
+        # out_dim이 8이므로, 앞 4개는 real, 뒤 4개는 imag로 가정
+        out_real = outputs[:, :self.out_dim//2]
+        out_imag = outputs[:, self.out_dim//2:]
+        return torch.complex(out_real, out_imag)
     
 class SimpleSelfAttention(nn.Module):
     def __init__(self, embed_dim, n_heads):
@@ -389,63 +460,66 @@ class ComplexDropout(nn.Module):
     def forward(self, x):
         return torch.complex(self.real_drop(x.real), self.imag_drop(x.imag))
 
+# =========================================================================================
+# 2. PARONet_Decoder 클래스를 아래 코드로 대체
+# =========================================================================================
 class PARONet_Decoder(nn.Module):
-    def __init__(self, coord_dim=3, latent_dim=256, grid_size=17, out_dim=8, dropout_p=0.2,
+    def __init__(self, coord_dim=3, latent_dim=256, out_dim=8, dropout_p=0.2,
                  region_params=None):
         super().__init__()
-        self.grid_size = grid_size
         self.coord_layer = nn.Linear(coord_dim, latent_dim)
         self.latent_to_field = ComplexLinear(latent_dim * 2, out_dim)
         self.dropout = ComplexDropout(dropout_p)
         self.bias = nn.Parameter(torch.zeros(out_dim, dtype=torch.cfloat))
         self.region_params = region_params
-        self.soft_operator = SoftRegionOperator(latent_dim*2, out_dim, n_ops=4)
-        self.n_ops = 4
+        
+        # SoftRegionOperator를 새로운 PARONetOperatorSelector로 교체
+        self.operator_selector = PARONetOperatorSelector(latent_dim * 2, out_dim, n_ops=4)
+        
+        # RL 에이전트가 선택한 운영자 설정을 저장할 변수
+        self.region_operator_config = None
 
     def forward(self, coords, latent, for_boundary=False):
         coords = coords.float()
         coord_feat = self.coord_layer(coords)
         latent_rep = latent.repeat_interleave(coords.shape[0] // latent.shape[0], dim=0)
-        combined = torch.cat([coord_feat, latent_rep.real], dim=1)  # (N, latent_dim*2)
-        region_mask = get_region_mask(
-            coords,
-            target_region_center=self.region_params['target_center'],
-            target_radius=self.region_params['target_radius'],
-            boundary_range=self.region_params['boundary_tol'],
-            xy_range=self.region_params['xy_range'],
-            z_range=self.region_params['z_range'],
-        )
-        region_feat = F.one_hot(region_mask, num_classes=self.n_ops).float()  # (N, n_ops)
+        
+        # 입력 피처를 복소수가 아닌 실수로 준비
+        combined_real = torch.cat([coord_feat, latent_rep.real], dim=1)  # (N, latent_dim*2)
 
-        if not for_boundary:
-            # ------ region별 pde_params 생성 -------
-            k_bg = 730.0
-            k_target = 750.0
-            k_boundary = 720.0
-            region_pde_params = {
-                0: torch.tensor([[k_bg]], device=coords.device),
-                1: torch.tensor([[k_target]], device=coords.device),
-                2: torch.tensor([[k_boundary]], device=coords.device),
-            }
-            pde_params_all = torch.zeros(coords.shape[0], 1, device=coords.device)  # (N, 1)
-            for reg_idx, pde_param in region_pde_params.items():
-                idxs = (region_mask == reg_idx)
-                pde_params_all[idxs] = pde_param  # broadcasting
-
-            # grid_shape 추정
-            region_len = coords.shape[0]
-            grid_size = int(round(region_len ** (1/3)))
-            grid_shape = (grid_size, grid_size, grid_size)
-
-            out = self.soft_operator(
-                combined, region_feat, grid_shape=grid_shape, pde_params=pde_params_all
-            )
+        # 경계 조건 계산 시에는 가장 간단한 MLP 운영자를 사용
+        if for_boundary:
+            out = self.operator_selector.operators[0](combined_real) # MLP 직접 호출
         else:
-            # boundary, bc 등 irregular → grid_shape/pde_params X
-            out = self.soft_operator(
-                combined, region_feat, grid_shape=None, pde_params=None
+            # ------ 지역별 pde_params 생성 -------
+            # 이 부분은 config 파일에서 관리하는 것이 더 유연함
+            k_bg = self.region_params.get('k_bg', 730.0)
+            k_target = self.region_params.get('k_target', 750.0)
+            k_boundary = self.region_params.get('k_boundary', 720.0)
+            
+            region_pde_map = {
+                0: torch.tensor([[k_bg]], device=coords.device),      # 배경
+                1: torch.tensor([[k_target]], device=coords.device),  # 타겟
+                2: torch.tensor([[k_boundary]], device=coords.device) # 경계
+            }
+            
+            # 임시로 region_mask를 여기서 생성하여 pde_params를 매핑
+            temp_region_mask = get_region_mask(coords, **self.region_params)
+            
+            pde_params_all = torch.zeros(coords.shape[0], 1, device=coords.device)
+            for reg_idx, pde_param in region_pde_map.items():
+                pde_params_all[temp_region_mask == reg_idx] = pde_param
+
+            # 핵심: operator_selector 호출 시 RL 에이전트의 선택(op_config)을 전달
+            out = self.operator_selector(
+                x=combined_real,
+                coords=coords,
+                pde_params=pde_params_all,
+                op_config=self.region_operator_config,
+                region_params=self.region_params
             )
 
+        # 최종 출력에 bias와 dropout 적용
         out = out + self.bias
         out = self.dropout(out)
         return out
