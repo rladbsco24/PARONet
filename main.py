@@ -1025,15 +1025,18 @@ def main(args):
     all_y = np.vstack([d.y_np for d in train_data])
     y_mean = all_y.mean(axis=0)
     y_std = all_y.std(axis=0) + 1e-8
-    agent = RegionOpRLAgent(ops=['fft','fno','mlp','psdtrans'], n_regions=4, epsilon=0.2)
+    
+    # 데이터 타입 변환
     for d in train_data:
-        d.y = to_complex(d.y.cpu().numpy())
-        d.boundary_p = to_complex(d.boundary_p.cpu().numpy())
+        # y는 복소수 형태를 기대하지 않으므로 실수형 float32로 유지
+        d.y = torch.tensor(d.y_np, dtype=torch.float32) 
+        d.boundary_p = torch.tensor(d.boundary_p, dtype=torch.float32)
     for d in test_data:
-        d.y = to_complex(d.y.cpu().numpy())
-        d.boundary_p = to_complex(d.boundary_p.cpu().numpy())
+        d.y = torch.tensor(d.y_np, dtype=torch.float32)
+        d.boundary_p = torch.tensor(d.boundary_p, dtype=torch.float32)
+        
     normalization_stats = (y_mean, y_std)
-    # custom_collate 함수는 이미 위에서 작성한 대로 사용
+    
     train_loader = DataLoader(
         train_data,
         batch_size=cfg['batch_size'],
@@ -1043,11 +1046,12 @@ def main(args):
     )
     test_loader = DataLoader(
         test_data,
-        batch_size=2,
+        batch_size=cfg.get('batch_size_test', 1), # 테스트 배치 사이즈 추가
         shuffle=False,
         collate_fn=custom_collate,
         drop_last=True
     )
+    
     # 3. 모델 초기화
     print('Initializing model...')
     
@@ -1065,44 +1069,46 @@ def main(args):
         else:
             return (float(x), float(x))
         
+    # ############################ 에러 수정 부분 ############################
+    # 'target_center' 키를 'target_region_center'로 변경하여 함수 정의와 일치시킴
     region_params = {
-        'target_center': to_tuple_float(cfg.get('target_coord', [0.0, 0.0, 0.04])),
+        'target_region_center': to_tuple_float(cfg.get('target_coord', [0.0, 0.0, 0.04])),
         'target_radius': to_float(cfg.get('target_radius', 0.005)),
         'boundary_tol': to_float(cfg.get('boundary_tol', 1e-5)),
         'xy_range': to_float(cfg.get('xy_range', 0.06)),
         'z_range': to_tuple_float(cfg.get('z_range', (0.01, 0.07))),
     }
-    # train_model 호출
+    # ######################################################################
+
     print("region_params", region_params)
     for k, v in region_params.items():
         print(f"{k}: {v} ({type(v)})")
-    # AcousticPINO3D_UQ에 region_params 전달!
-    # ----------- target_coord 정의 먼저! -----------
+
     target_coord = cfg.get('target_coord', [0.0, 0.0, 0.04])
-    region_operator_config = {0: 'fft', 1: 'fno', 2: 'mlp', 3: 'psdtrans'}
+    
     model = AcousticPINO3D_UQ(
         in_dim=6, ffm_scales=cfg['ffm_scales'], ffm_dim=cfg['ffm_dim'], gnn_dim=cfg['gnn_dim'],
         dec_dim=cfg['dec_dim'], out_dim=8, dropout_p=cfg['dropout_p'],
         latent_dim=256, grid_size=cfg['grid_size_train'],
         region_params=region_params
     ).to(device)
-    agent = RegionOpRLAgent(ops=['fft','fno','mlp'], n_regions=3, epsilon=0.2)
-    loss_hist = train_model(
-        model, train_loader, device, y_mean, y_std, target_coord, cfg,
-        region_params, # <-- 추가
-        k=cfg['k'],
-        epochs=cfg['epochs'], lr=cfg['lr'], w_pde=cfg['w_pde'], w_bc=cfg['w_bc'], w_target=cfg['w_target'],
-        logdir=cfg.get('logdir','./logs'), agent=agent # <-- agent 추가!
-    )
+    
+    # RL 에이전트 초기화 (3개 지역: 배경, 타겟, 경계)
+    agent = RegionOpRLAgent(ops=['fft','fno','mlp','psdtrans'], n_regions=3, epsilon=0.2)
+    
     # 4. 학습
     if args.train:
         print('Training (Data + Physics-Informed Loss)...')
-        target_coord = cfg.get('target_coord', [0.0, 0.0, 0.04])
         loss_hist = train_model(
             model, train_loader, device, y_mean, y_std, target_coord, cfg,
-            epochs=cfg['epochs'], lr=cfg['lr'], w_pde=cfg['w_pde'], w_bc=cfg['w_bc'], w_target=cfg['w_target'], logdir=cfg.get('logdir','./logs')
+            region_params, # <-- region_params 전달
+            k=cfg['k'],
+            epochs=cfg['epochs'], lr=cfg['lr'], w_pde=cfg.get('w_pde', 1.0), 
+            w_bc=cfg.get('w_bc', 1.0), w_target=cfg.get('w_target', 1.0),
+            logdir=cfg.get('logdir','./logs'), agent=agent # <-- agent 전달
         )
         save_model(model, os.path.join(cfg.get('logdir','./logs'), 'best_model.pt'))
+        plt.figure()
         plt.plot(loss_hist)
         plt.xlabel('Epoch'); plt.ylabel('Total Loss')
         plt.yscale('log'); plt.title('Training loss')
@@ -1114,27 +1120,35 @@ def main(args):
         print('Evaluating test data and visualizing...')
         load_model(model, os.path.join(cfg.get('logdir','./logs'), 'best_model.pt'), device)
         model.eval()
-        with torch.no_grad():
-            for idx, test_batch in enumerate(test_loader):
-                test_batch = test_batch.to(device)
-                mean_pred, std_pred = predict_mc_dropout(model, test_batch, n_samples=cfg['n_mc'], device=device)
-                coords, X, Y, Z = sample_query_points_3d(grid_size=cfg['grid_size_test'])
-                y_mean, y_std = normalization_stats
-                mean_pred_denorm = mean_pred
-                std_pred_denorm = std_pred * y_std
-                p_real, p_imag = mean_pred_denorm.real, mean_pred_denorm.imag
-                vx_r, vy_r, vz_r, vx_i, vy_i, vz_i = mean_pred_denorm[:,2], mean_pred_denorm[:,3], mean_pred_denorm[:,4], mean_pred_denorm[:,5], mean_pred_denorm[:,6], mean_pred_denorm[:,7]
-                U_mean = gorkov_potential_torch_3d(
-                    torch.tensor(p_real), torch.tensor(p_imag),
-                    torch.tensor(vx_r), torch.tensor(vy_r), torch.tensor(vz_r),
-                    torch.tensor(vx_i), torch.tensor(vy_i), torch.tensor(vz_i)
-                ).numpy().reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
-                U_std = np.zeros_like(U_mean)
-                for i in range(mean_pred.shape[0]):
-                    std_samp = std_pred_denorm[i]
-                    U_std.flat[i] = np.linalg.norm(std_samp)
-                U_std = U_std.reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
-                plot_field_gorkov_3d(U_mean, U_std, X, Y, Z, z_idx=cfg['grid_size_test']//2, savedir=cfg.get('logdir','./logs'))
+        
+        test_sample = next(iter(test_loader))
+        test_sample = test_sample.to(device)
+        
+        mean_pred, std_pred = predict_mc_dropout(model, test_sample, n_samples=cfg['n_mc'], device=device)
+        
+        coords, X, Y, Z = sample_query_points_3d(grid_size=cfg['grid_size_test'])
+        y_mean_t = torch.from_numpy(y_mean).to(device)
+        y_std_t = torch.from_numpy(y_std).to(device)
+
+        # 역정규화
+        mean_pred_denorm = mean_pred * y_std + y_mean
+        std_pred_denorm = std_pred * y_std
+
+        p_real, p_imag = mean_pred_denorm[:,0], mean_pred_denorm[:,1]
+        vx_r, vy_r, vz_r = mean_pred_denorm[:,2], mean_pred_denorm[:,3], mean_pred_denorm[:,4]
+        vx_i, vy_i, vz_i = mean_pred_denorm[:,5], mean_pred_denorm[:,6], mean_pred_denorm[:,7]
+        
+        U_mean = gorkov_potential_torch_3d(
+            torch.tensor(p_real), torch.tensor(p_imag),
+            torch.tensor(vx_r), torch.tensor(vy_r), torch.tensor(vz_r),
+            torch.tensor(vx_i), torch.tensor(vy_i), torch.tensor(vz_i)
+        ).numpy().reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
+        
+        # 불확실성 시각화 (예: 압력의 표준편차)
+        p_std = np.sqrt(std_pred_denorm[:,0]**2 + std_pred_denorm[:,1]**2)
+        U_std_reshaped = p_std.reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
+
+        plot_field_gorkov_3d(U_mean, U_std_reshaped, X, Y, Z, z_idx=cfg['grid_size_test']//2, savedir=cfg.get('logdir','./logs'))
 # --------- CLI 실행 ---------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Meta-PINO-AFC 논문 전체 실험 파이프라인")
