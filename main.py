@@ -93,8 +93,8 @@ class ComplexLinear(nn.Module):
             out += self.bias
         return out
 
-def get_region_mask(coords, target_region_center, target_radius, boundary_range, xy_range, z_range):
-    dists = torch.norm(coords - torch.tensor(target_region_center, dtype=coords.dtype, device=coords.device), dim=1)
+def get_region_mask(coords, target_center, target_radius, boundary_range, xy_range, z_range):
+    dists = torch.norm(coords - torch.tensor(target_center, dtype=coords.dtype, device=coords.device), dim=1)
     target_mask = dists < target_radius
     boundary_mask = (
         (torch.abs(coords[:,0] + xy_range) < boundary_range) | (torch.abs(coords[:,0] - xy_range) < boundary_range) |
@@ -108,7 +108,23 @@ def get_region_mask(coords, target_region_center, target_radius, boundary_range,
 
 def complex_mse_loss(pred, target):
     return ((pred - target).abs() ** 2).mean()
-    
+
+def smooth_region_mask(coords, region_params, beta=10.0):
+    """Smooth transition between regions"""
+    distances = compute_distances_to_regions(coords, region_params)
+    weights = torch.exp(-beta * distances)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    return weights
+
+def interface_continuity_loss(pred, coords, region_mask):
+    """Ensure continuity at region boundaries"""
+    interface_points = find_interface_points(region_mask)
+    if len(interface_points) > 0:
+        grad = torch.autograd.grad(pred.sum(), coords, create_graph=True)[0]
+        jump = compute_jump_at_interface(pred, grad, interface_points)
+        return torch.mean(jump**2)
+    return torch.tensor(0.0)
+
 def to_complex(tensor):
     # numpy 배열이 들어오면 Tensor로 변환
     if isinstance(tensor, np.ndarray):
@@ -155,91 +171,58 @@ class PARONetOperatorSelector(nn.Module):
         self.op_name_to_idx = {'mlp': 0, 'fno': 1, 'fft': 2, 'psdtrans': 3}
 
     def forward(self, x, coords, pde_params, op_config, region_params):
-        """
-        Args:
-            x (Tensor): 입력 피처 (N, in_dim)
-            coords (Tensor): 쿼리 포인트 좌표 (N, 3)
-            pde_params (Tensor): 각 포인트에 매핑된 PDE 파라미터 (N, pde_dim)
-            op_config (dict): RL 에이전트가 선택한 지역-운영자 매핑. 예: {0: 'fft', 1: 'fno', 2: 'mlp'}
-            region_params (dict): 지역 마스크 생성을 위한 파라미터 딕셔너리.
-        """
-        # op_config가 없으면, 가장 간단한 MLP를 기본 운영자로 사용 (Fallback)
         if op_config is None:
             return self.operators[0](x)
 
-        # 1. 입력 좌표를 기반으로 각 포인트의 지역(region)을 결정하는 마스크 생성
+        # get_region_mask 호출
         region_mask = get_region_mask(
-            coords,
-            target_region_center=region_params['target_center'],
+            coords=coords,
+            target_center=region_params['target_center'],
             target_radius=region_params['target_radius'],
             boundary_range=region_params['boundary_tol'],
             xy_range=region_params['xy_range'],
             z_range=region_params['z_range'],
         )
 
-        # 2. 최종 출력을 담을 텐서 초기화
         outputs = torch.zeros(x.shape[0], self.out_dim, device=x.device, dtype=torch.float32)
         
-        # 입력 x를 복소수로 변환 (필요시)
         if not torch.is_complex(x):
             x = torch.complex(x, torch.zeros_like(x))
 
-        # 3. 각 지역별로 루프를 돌며 선택된 운영자를 적용
         for region_idx, op_name in op_config.items():
-            # 현재 지역에 해당하는 포인트들의 마스크
             mask = (region_mask == region_idx)
             
-            # 해당 지역에 포인트가 없으면 다음 지역으로
             if not torch.any(mask):
                 continue
             
-            # 선택된 운영자 인스턴스 가져오기
             op_idx = self.op_name_to_idx[op_name]
             op = self.operators[op_idx]
 
-            # 운영자별 입력 조건에 맞게 호출
-            # FNO와 PSDTransformer는 전체가 정규 격자(grid)일 때 가장 잘 작동합니다.
-            # 포인트의 일부만 마스킹된 비정규적 데이터에 대해서는 한계가 있을 수 있으므로,
-            # 이 경우 가장 강건한 MLP로 대체(fallback)하는 것이 안정적일 수 있습니다.
-            # 여기서는 구현의 편의를 위해 일단 그대로 적용합니다.
-            
             x_masked = x[mask]
             
             if op_name == 'fno':
-                # FNO는 grid_shape이 필요. 마스킹된 데이터는 정확한 grid를 형성하지 못할 수 있음.
-                # 전체 데이터가 하나의 지역일 때 가장 잘 작동함.
                 grid_size_approx = int(round(x_masked.shape[0] ** (1/3)))
                 grid_shape_approx = (grid_size_approx, grid_size_approx, grid_size_approx)
                 if np.prod(grid_shape_approx) == x_masked.shape[0]:
                     result = op(x_masked, grid_shape_approx)
                 else:
-                    # 격자 형성이 안되면 MLP로 대체
                     result = self.operators[0](x_masked)
 
             elif op_name == 'psdtrans':
                 pde_params_masked = pde_params[mask]
                 result = op(x_masked, pde_params=pde_params_masked)
 
-            else: # 'mlp' 또는 'fft' (포인트별 연산)
+            else:
                 result = op(x_masked)
 
-            # 연산 결과를 최종 출력 텐서의 해당 위치에 저장
-            # 결과가 복소수일 경우 실수부만 취하거나, out_dim에 맞게 처리 필요.
-            # 여기서는 out_dim이 8(실수)이라고 가정하고, 복소수 결과는 실수/허수부로 분리.
             if torch.is_complex(result):
-                # 예: p_real, p_imag, v_real, v_imag...
-                # out_dim이 8이므로 (N, 4) 복소수 또는 (N, 8) 실수가 나와야 함
-                # 간단하게 실수부만 취하거나, 복소수를 실수로 변환
-                # 아래는 out_dim=8을 가정하고 real/imag을 합치는 예시
                 if result.shape[-1] * 2 == self.out_dim:
                      outputs[mask] = torch.cat([result.real, result.imag], dim=-1)
-                else: # 차원이 안맞으면 실수부만 사용
+                else:
                      outputs[mask] = result.real
             else:
                  outputs[mask] = result
 
-        # PARONet_Decoder는 복소수 출력을 기대하므로, 최종 결과를 복소수로 변환
-        # out_dim이 8이므로, 앞 4개는 real, 뒤 4개는 imag로 가정
         out_real = outputs[:, :self.out_dim//2]
         out_imag = outputs[:, self.out_dim//2:]
         return torch.complex(out_real, out_imag)
@@ -470,10 +453,11 @@ class PARONet_Decoder(nn.Module):
         self.coord_layer = nn.Linear(coord_dim, latent_dim)
         self.latent_to_field = ComplexLinear(latent_dim * 2, out_dim)
         self.dropout = ComplexDropout(dropout_p)
-        self.bias = nn.Parameter(torch.zeros(out_dim, dtype=torch.cfloat))
+        # bias도 복소수 차원에 맞게 조정 (8 -> 4)
+        self.bias = nn.Parameter(torch.zeros(out_dim // 2, dtype=torch.cfloat))
         self.region_params = region_params
         
-        # SoftRegionOperator를 새로운 PARONetOperatorSelector로 교체
+        # PARONetOperatorSelector 초기화
         self.operator_selector = PARONetOperatorSelector(latent_dim * 2, out_dim, n_ops=4)
         
         # RL 에이전트가 선택한 운영자 설정을 저장할 변수
@@ -482,35 +466,48 @@ class PARONet_Decoder(nn.Module):
     def forward(self, coords, latent, for_boundary=False):
         coords = coords.float()
         coord_feat = self.coord_layer(coords)
-        latent_rep = latent.repeat_interleave(coords.shape[0] // latent.shape[0], dim=0)
         
-        # 입력 피처를 복소수가 아닌 실수로 준비
-        combined_real = torch.cat([coord_feat, latent_rep.real], dim=1)  # (N, latent_dim*2)
-
-        # 경계 조건 계산 시에는 가장 간단한 MLP 운영자를 사용
-        if for_boundary:
-            out = self.operator_selector.operators[0](combined_real) # MLP 직접 호출
+        # latent이 복소수인 경우 처리
+        if torch.is_complex(latent):
+            latent_real = torch.cat([latent.real, latent.imag], dim=-1)
         else:
-            # ------ 지역별 pde_params 생성 -------
-            # 이 부분은 config 파일에서 관리하는 것이 더 유연함
+            latent_real = latent
+            
+        latent_rep = latent_real.repeat_interleave(coords.shape[0] // latent_real.shape[0], dim=0)
+        
+        combined_real = torch.cat([coord_feat, latent_rep], dim=1)
+
+        if for_boundary:
+            # MLP는 실수 출력을 반환하므로 복소수로 변환 필요
+            out_real = self.operator_selector.operators[0](combined_real)
+            if out_real.shape[-1] == 8:  # 실수 8차원인 경우
+                out = torch.complex(out_real[:, :4], out_real[:, 4:])
+            else:  # 이미 적절한 차원인 경우
+                out = torch.complex(out_real, torch.zeros_like(out_real))
+        else:
             k_bg = self.region_params.get('k_bg', 730.0)
             k_target = self.region_params.get('k_target', 750.0)
             k_boundary = self.region_params.get('k_boundary', 720.0)
             
             region_pde_map = {
-                0: torch.tensor([[k_bg]], device=coords.device),      # 배경
-                1: torch.tensor([[k_target]], device=coords.device),  # 타겟
-                2: torch.tensor([[k_boundary]], device=coords.device) # 경계
+                0: torch.tensor([[k_bg]], device=coords.device),
+                1: torch.tensor([[k_target]], device=coords.device),
+                2: torch.tensor([[k_boundary]], device=coords.device)
             }
             
-            # 임시로 region_mask를 여기서 생성하여 pde_params를 매핑
-            temp_region_mask = get_region_mask(coords, **self.region_params)
+            temp_region_mask = get_region_mask(
+                coords=coords,
+                target_center=self.region_params['target_center'],
+                target_radius=self.region_params['target_radius'],
+                boundary_range=self.region_params['boundary_tol'],
+                xy_range=self.region_params['xy_range'],
+                z_range=self.region_params['z_range']
+            )
             
             pde_params_all = torch.zeros(coords.shape[0], 1, device=coords.device)
             for reg_idx, pde_param in region_pde_map.items():
                 pde_params_all[temp_region_mask == reg_idx] = pde_param
 
-            # 핵심: operator_selector 호출 시 RL 에이전트의 선택(op_config)을 전달
             out = self.operator_selector(
                 x=combined_real,
                 coords=coords,
@@ -519,7 +516,14 @@ class PARONet_Decoder(nn.Module):
                 region_params=self.region_params
             )
 
-        # 최종 출력에 bias와 dropout 적용
+        # out이 이미 복소수이므로 bias 추가만 하면 됨
+        if not torch.is_complex(out):
+            # 만약 실수로 반환된 경우 복소수로 변환
+            if out.shape[-1] == 8:
+                out = torch.complex(out[:, :4], out[:, 4:])
+            else:
+                out = torch.complex(out, torch.zeros_like(out))
+                
         out = out + self.bias
         out = self.dropout(out)
         return out
@@ -707,7 +711,7 @@ def create_synthetic_dataset_3d(
     device='cpu'
 ):
     data_list = []
-    for i in range(n_samples):
+    for i in tqdm(range(n_samples), desc="Creating dataset"):
         positions, phases, amplitudes = generate_transducer_array_3d(
             n_transducers, amp_base=amp_base, amp_var=amp_var
         )
@@ -1025,15 +1029,6 @@ def main(args):
     all_y = np.vstack([d.y_np for d in train_data])
     y_mean = all_y.mean(axis=0)
     y_std = all_y.std(axis=0) + 1e-8
-    
-    # 데이터 타입 변환 (PyTorch 텐서로)
-    for d in train_data:
-        d.y = torch.from_numpy(d.y_np).float()
-        d.boundary_p = torch.from_numpy(d.boundary_p).float()
-    for d in test_data:
-        d.y = torch.from_numpy(d.y_np).float()
-        d.boundary_p = torch.from_numpy(d.boundary_p).float()
-        
     normalization_stats = (y_mean, y_std)
     
     train_loader = DataLoader(
@@ -1050,11 +1045,11 @@ def main(args):
     
     def to_float(x): return float(x)
     def to_tuple_float(x):
-        if isinstance(x, str): return tuple(map(float, x.strip("[]()").split(',')))
+        if isinstance(x, str): return tuple(map(float, x.strip("[()]").split(',')))
         return tuple(map(float, x)) if isinstance(x, (list, tuple)) else (float(x), float(x))
         
     region_params = {
-        'target_region_center': to_tuple_float(cfg.get('target_coord')),
+        'target_center': to_tuple_float(cfg.get('target_coord')),  # 'target_region_center' -> 'target_center'
         'target_radius': to_float(cfg.get('target_radius')),
         'boundary_tol': to_float(cfg.get('boundary_tol')),
         'xy_range': to_float(cfg.get('xy_range')),
@@ -1062,17 +1057,41 @@ def main(args):
     }
     print("region_params:", region_params)
 
-    model = AcousticPINO3D_UQ(
-        in_dim=6, ffm_scales=cfg['ffm_scales'], ffm_dim=cfg['ffm_dim'], gnn_dim=cfg['gnn_dim'],
-        dec_dim=cfg['dec_dim'], out_dim=8, dropout_p=cfg['dropout_p'],
-        latent_dim=cfg['latent_dim'], grid_size=cfg['grid_size_train'],
-        region_params=region_params
-    ).to(device)
+    print("Creating model...")
+    try:
+        model = AcousticPINO3D_UQ(
+            in_dim=6, ffm_scales=cfg['ffm_scales'], ffm_dim=cfg['ffm_dim'], gnn_dim=cfg['gnn_dim'],
+            dec_dim=cfg['dec_dim'], out_dim=8, dropout_p=cfg['dropout_p'],
+            latent_dim=cfg['latent_dim'], grid_size=cfg['grid_size_train'],
+            region_params=region_params
+        )
+        print("Model created successfully")
+        
+        print("Moving model to device...")
+        model = model.to(device)
+        print("Model moved to device successfully")
+        
+    except Exception as e:
+        print(f"Error during model initialization: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
     # 4. 학습 (args.train 플래그가 True일 때만 실행)
     if args.train:
         print('Starting Training Process...')
+        print(f'Training with {len(train_loader)} batches')
+
+        # agent를 여기서 정의
         agent = RegionOpRLAgent(ops=['fft','fno','mlp','psdtrans'], n_regions=3, epsilon=0.2)
+        print('RL Agent created')
+        
+        # config에서 region_operator_config가 있으면 사용
+        if 'region_operator_config' in cfg:
+            initial_config = {int(k): v for k, v in cfg['region_operator_config'].items()}
+            model.decoder.region_operator_config = initial_config
+            print(f"Using initial operator config from config file: {initial_config}")
+        
         target_coord = cfg.get('target_coord')
         
         loss_hist = train_model(
@@ -1121,11 +1140,32 @@ def main(args):
         U_std_reshaped = p_std.reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
 
         plot_field_gorkov_3d(U_mean, U_std_reshaped, X, Y, Z, z_idx=cfg['grid_size_test']//2, savedir=cfg.get('logdir','./logs'))
+    
+    # Forward pass 테스트는 학습/테스트 전에 실행되도록 이동
+    print("\nMain function completed.")
 # --------- CLI 실행 ---------
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Meta-PINO-AFC 논문 전체 실험 파이프라인")
-    parser.add_argument('--config', type=str, default='config.yaml')
-    parser.add_argument('--train', action='store_true')
-    parser.add_argument('--test', action='store_true')
-    args, unknown = parser.parse_known_args()
+    # Jupyter notebook 환경 감지
+    try:
+        get_ipython()  # Jupyter에서만 정의되는 함수
+        is_jupyter = True
+    except NameError:
+        is_jupyter = False
+    
+    if is_jupyter:
+        # Jupyter에서는 직접 Args 클래스 사용
+        class Args:
+            config = "config.yaml"
+            train = True
+            test = True
+        args = Args()
+        print("[INFO] Running in Jupyter notebook mode")
+    else:
+        # 일반 Python 스크립트 환경
+        parser = argparse.ArgumentParser(description="Meta-PINO-AFC 논문 전체 실험 파이프라인")
+        parser.add_argument('--config', type=str, default='config.yaml')
+        parser.add_argument('--train', action='store_true')
+        parser.add_argument('--test', action='store_true')
+        args = parser.parse_args()
+    
     main(args)
