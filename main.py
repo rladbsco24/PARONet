@@ -106,8 +106,72 @@ def get_region_mask(coords, target_center, target_radius, boundary_range, xy_ran
     region_mask[target_mask] = 1
     return region_mask
 
+def plot_pressure_field_2d(model, test_data, device, y_slice=0.0, save_path=None):
+    """x-z 평면에서 압력 필드 시각화"""
+    model.eval()
+    
+    # 2D 그리드 생성 (cm 단위로 변환)
+    x = np.linspace(-5, 5, 100)  # -0.05 to 0.05 m -> -5 to 5 cm
+    z = np.linspace(0, 8, 100)   # 0 to 0.08 m -> 0 to 8 cm
+    X, Z = np.meshgrid(x, z)
+    Y = np.ones_like(X) * y_slice
+    
+    # 미터 단위로 변환하여 좌표 생성
+    coords_m = np.stack([X.ravel()/100, Y.ravel()/100, Z.ravel()/100], axis=1)
+    coords_tensor = torch.tensor(coords_m, dtype=torch.float32, device=device)
+    
+    # 테스트 데이터에서 첫 번째 샘플 사용
+    if isinstance(test_data, list):
+        sample_data = test_data[0].to(device)
+    else:
+        sample_data = test_data.to(device)
+    
+    with torch.no_grad():
+        # Encoder로 latent 생성
+        latent = model.encoder(
+            sample_data.x, 
+            sample_data.edge_index, 
+            sample_data.x[:, :3], 
+            sample_data.batch if hasattr(sample_data, 'batch') else torch.zeros(sample_data.x.size(0), dtype=torch.long, device=device)
+        )
+        
+        # Decoder로 압력 예측
+        pred = model.decoder(coords_tensor, latent)
+        
+        # 압력 절대값 계산
+        if torch.is_complex(pred):
+            pressure = pred[:, 0].abs().cpu().numpy()
+        else:
+            # 실수부와 허수부가 분리되어 있는 경우
+            p_real = pred[:, 0].cpu().numpy()
+            p_imag = pred[:, 1].cpu().numpy() if pred.shape[1] > 1 else np.zeros_like(p_real)
+            pressure = np.sqrt(p_real**2 + p_imag**2)
+    
+    # 2D 배열로 reshape
+    pressure_2d = pressure.reshape(100, 100)
+    
+    # 플롯
+    plt.figure(figsize=(8, 10))
+    plt.imshow(pressure_2d, extent=[-5, 5, 0, 8], 
+               origin='lower', cmap='viridis', aspect='auto')
+    plt.colorbar(label='Pressure')
+    plt.xlabel('x (cm)')
+    plt.ylabel('z (cm)')
+    plt.title('Pressure Field (x-z Plane)')
+    
+    # 트랜스듀서 위치 표시 (옵션)
+    transducer_positions = sample_data.x[:, :3].cpu().numpy()
+    trans_x = transducer_positions[:, 0] * 100  # m to cm
+    trans_z = transducer_positions[:, 2] * 100
+    plt.scatter(trans_x, trans_z, c='red', s=20, marker='o', label='Transducers')
+    plt.legend()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    
 def complex_mse_loss(pred, target):
-    return ((pred - target).abs() ** 2).mean()
+    return ((pred - target).abs() ** 2).mean() * 1e-4
 
 def smooth_region_mask(coords, region_params, beta=10.0):
     """Smooth transition between regions"""
@@ -174,7 +238,6 @@ class PARONetOperatorSelector(nn.Module):
         if op_config is None:
             return self.operators[0](x)
 
-        # get_region_mask 호출
         region_mask = get_region_mask(
             coords=coords,
             target_center=region_params['target_center'],
@@ -186,8 +249,11 @@ class PARONetOperatorSelector(nn.Module):
 
         outputs = torch.zeros(x.shape[0], self.out_dim, device=x.device, dtype=torch.float32)
         
-        if not torch.is_complex(x):
-            x = torch.complex(x, torch.zeros_like(x))
+        # x가 복소수인지 확인하고 처리
+        if torch.is_complex(x):
+            x_for_processing = x
+        else:
+            x_for_processing = x
 
         for region_idx, op_name in op_config.items():
             mask = (region_mask == region_idx)
@@ -198,7 +264,16 @@ class PARONetOperatorSelector(nn.Module):
             op_idx = self.op_name_to_idx[op_name]
             op = self.operators[op_idx]
 
-            x_masked = x[mask]
+            # 각 operator에 맞는 입력 형태로 변환
+            if op_name in ['mlp', 'fno', 'psdtrans']:
+                # 이 operators는 실수 입력을 기대함
+                if torch.is_complex(x_for_processing):
+                    x_masked = x_for_processing[mask].real
+                else:
+                    x_masked = x_for_processing[mask]
+            else:  # 'fft'
+                # FFT operator는 복소수를 처리할 수 있음
+                x_masked = x_for_processing[mask]
             
             if op_name == 'fno':
                 grid_size_approx = int(round(x_masked.shape[0] ** (1/3)))
@@ -206,6 +281,9 @@ class PARONetOperatorSelector(nn.Module):
                 if np.prod(grid_shape_approx) == x_masked.shape[0]:
                     result = op(x_masked, grid_shape_approx)
                 else:
+                    # MLP로 대체 - 실수 입력 보장
+                    if torch.is_complex(x_masked):
+                        x_masked = x_masked.real
                     result = self.operators[0](x_masked)
 
             elif op_name == 'psdtrans':
@@ -215,6 +293,7 @@ class PARONetOperatorSelector(nn.Module):
             else:
                 result = op(x_masked)
 
+            # 결과 처리
             if torch.is_complex(result):
                 if result.shape[-1] * 2 == self.out_dim:
                      outputs[mask] = torch.cat([result.real, result.imag], dim=-1)
@@ -315,8 +394,9 @@ class RegionMLP(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(in_dim, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, out_dim)
         )
         self.out_dim = out_dim
@@ -368,15 +448,16 @@ class FNO3DLayer(nn.Module):
         modes_z_eff = min(self.modes, modes_z)
 
         x_ft = torch.fft.rfftn(x, s=(nx, ny, nz), dim=[2,3,4])
-        # 디버그 출력
-        print(f"x_ft.shape: {x_ft.shape}")
-        print(f"weight.shape (slice): {self.weight[:, :, :modes_x, :modes_y, :modes_z_eff].shape}")
+        
+        # 디버깅 출력 제거 또는 조건부로 변경
+        # print(f"x_ft.shape: {x_ft.shape}")
+        # print(f"weight.shape (slice): {self.weight[:, :, :modes_x, :modes_y, :modes_z_eff].shape}")
 
         # 슬라이스를 명확히 맞추기
-        x_ft_cut = x_ft[:, :, :modes_x, :modes_y, :modes_z_eff]          # (B, C, mx, my, mz)
-        weight_cut = self.weight[:, :, :modes_x, :modes_y, :modes_z_eff] # (C, O, mx, my, mz)
+        x_ft_cut = x_ft[:, :, :modes_x, :modes_y, :modes_z_eff]
+        weight_cut = self.weight[:, :, :modes_x, :modes_y, :modes_z_eff]
 
-        # einsum: (B, C, mx, my, mz), (C, O, mx, my, mz) → (B, O, mx, my, mz)
+        # einsum
         out_ft = torch.zeros(B, self.out_channels, nx, ny, modes_z, dtype=torch.cfloat, device=x.device)
         out_ft[:, :, :modes_x, :modes_y, :modes_z_eff] = torch.einsum(
             "bcmxy,comxy->bomxy", x_ft_cut, weight_cut
@@ -454,7 +535,7 @@ class PARONet_Decoder(nn.Module):
         self.latent_to_field = ComplexLinear(latent_dim * 2, out_dim)
         self.dropout = ComplexDropout(dropout_p)
         # bias도 복소수 차원에 맞게 조정 (8 -> 4)
-        self.bias = nn.Parameter(torch.zeros(out_dim // 2, dtype=torch.cfloat))
+        self.bias = nn.Parameter(torch.zeros(out_dim // 2, dtype=torch.cfloat) * 0.01)
         self.region_params = region_params
         
         # PARONetOperatorSelector 초기화
@@ -462,20 +543,35 @@ class PARONet_Decoder(nn.Module):
         
         # RL 에이전트가 선택한 운영자 설정을 저장할 변수
         self.region_operator_config = None
+        
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, coords, latent, for_boundary=False):
         coords = coords.float()
         coord_feat = self.coord_layer(coords)
         
-        # latent이 복소수인 경우 처리
+        # latent의 차원 확인 및 처리
         if torch.is_complex(latent):
-            latent_real = torch.cat([latent.real, latent.imag], dim=-1)
+            # 복소수인 경우 실수부만 사용 (또는 실수부와 허수부를 연결)
+            latent_real = latent.real
         else:
             latent_real = latent
             
+        # latent_rep 생성 시 차원 확인
+        if len(latent_real.shape) == 1:
+            latent_real = latent_real.unsqueeze(0)
+            
         latent_rep = latent_real.repeat_interleave(coords.shape[0] // latent_real.shape[0], dim=0)
         
+        # combined_real의 차원이 latent_dim * 2 = 512가 되도록 확인
         combined_real = torch.cat([coord_feat, latent_rep], dim=1)
+        
+        # 디버깅을 위한 출력 (필요시)
+        # print(f"coord_feat shape: {coord_feat.shape}, latent_rep shape: {latent_rep.shape}, combined_real shape: {combined_real.shape}")
 
         if for_boundary:
             # MLP는 실수 출력을 반환하므로 복소수로 변환 필요
@@ -717,6 +813,7 @@ def create_synthetic_dataset_3d(
         )
         coords, _, _, _ = sample_query_points_3d(grid_size, xy_range, z_range)
         field = synthesize_pressure_and_velocity_3d(positions, phases, amplitudes, coords)
+        field = (field - field.mean()) / (field.std() + 1e-8)
         mask_b = mask_boundary_points_3d(coords, xy_range, z_range)
         data = build_pyg_data_3d(positions, phases, amplitudes, coords, field, device=device)
         mask_b = mask_boundary_points_3d(coords, xy_range, z_range)
@@ -759,8 +856,9 @@ def custom_collate(data_list):
 
 # --------- Target Pressure Loss ---------
 def target_point_loss(model, target_coord, latent):
-    pred = model.decoder(target_coord.type(torch.cfloat), latent.type(torch.cfloat))
-    p_abs = pred.abs()
+    # 복소수로 변환하지 말고 실수로 전달
+    pred = model.decoder(target_coord, latent)  # .type(torch.cfloat) 제거
+    p_abs = pred[:, 0].abs()  # 첫 번째 채널(압력)의 절대값
     return -torch.mean(p_abs)
 
 # --------- Early Stopping 및 로그 ---------
@@ -842,8 +940,8 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
         list: 에포크별 학습 손실 기록.
     """
     # 1. 최적화기, 스케줄러, 손실 가중치 등 초기 설정
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=50, factor=0.5, verbose=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     early_stop = EarlyStopping(patience=cfg.get('patience', 100), warmup=cfg.get('warmup', 100))
     loss_hist = []
 
@@ -856,11 +954,35 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
     for epoch in tqdm(range(epochs), desc="Training PARONet"):
         model.train()
         epoch_total_loss = 0
+        
+        # ========== 9. Region Operator 최적화 ==========
+        # RL agent의 epsilon 감소 (exploration 감소)
+        if agent and epoch > 500:
+            agent.epsilon = max(0.01, agent.epsilon * 0.99)
+            if epoch % 100 == 0:
+                print(f"  └─ RL Agent epsilon: {agent.epsilon:.4f}")
 
         # 에포크 시작 시, RL 에이전트가 운영자 조합(정책)을 선택
         if agent:
             region_operator_config = agent.select_operators()
-            model.decoder.region_operator_config = region_operator_config
+        
+        # ========== 7. Warm-up 전략 ==========
+        # 처음에는 data loss만 학습, 점진적으로 physics loss 추가
+        if epoch < 100:
+            w_pde_current = 0.0
+            w_bc_current = 0.0
+            w_target_current = 0.0
+        elif epoch < 500:
+            # 100~500 에포크 동안 점진적으로 증가
+            progress = (epoch - 100) / 400
+            w_pde_current = w_pde * progress
+            w_bc_current = w_bc * progress
+            w_target_current = w_target * progress
+        else:
+            # 500 에포크 이후 전체 가중치 사용
+            w_pde_current = w_pde
+            w_bc_current = w_bc
+            w_target_current = w_target
 
         # 3. 배치 단위 학습 루프
         for batch in train_loader:
@@ -875,7 +997,9 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
             # 모델의 주 예측값(내부 전체 포인트)
             pred_interior = model.decoder(batch.coords[batch.mask_interior], latent)
             y_interior = torch.complex(batch.y[batch.mask_interior, 0], batch.y[batch.mask_interior, 1])
-            loss_pressure = complex_mse_loss(pred_interior[:, 0], y_interior)
+
+            # 상대적 손실 사용
+            loss_pressure = (pred_interior[:, 0] - y_interior).abs().mean() / (y_interior.abs().mean() + 1e-6)
 
             # Velocity는 실수부만 비교
             pred_v_real = torch.cat([pred_interior[:, 1:4].real, pred_interior[:, 1:4].imag], dim=1) # 예시, 모델 출력에 맞게 수정
@@ -888,24 +1012,50 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
             true_bc = torch.complex(batch.boundary_p[:, 0], batch.boundary_p[:, 1])
             loss_bc = complex_mse_loss(pred_bc[:, 0], true_bc)
 
-            # 3-3. 물리 정보 손실 (Physics-Informed Loss: PDE Residual)
+            # 3-3. 물리 정보 손실 (Physics-Informed Loss: PDE Residual) - 더 안정적인 버전
             coords_int_full = batch.coords[batch.mask_interior].clone().requires_grad_(True)
             pred_pde = model.decoder(coords_int_full, latent)
             p_val = pred_pde[:, 0]
 
-            # 헬름홀츠 방정식 잔차 계산
-            grad_p = torch.autograd.grad(p_val.sum(), coords_int_full, create_graph=True)[0]
-            lap_p = torch.zeros_like(p_val.real)
-            for i in range(3):
-                grad_p_i = grad_p[:, i]
-                grad2_p_i = torch.autograd.grad(grad_p_i.sum(), coords_int_full, create_graph=True)[0][:, i]
-                lap_p = lap_p + grad2_p_i
-            
+            # 복소수를 실수부와 허수부로 분리
+            p_real = p_val.real
+            p_imag = p_val.imag
+
+            # Laplacian 계산을 위한 함수
+            def compute_laplacian(u, coords):
+                grad = torch.autograd.grad(outputs=u.sum(), inputs=coords, 
+                                           create_graph=True, retain_graph=True, allow_unused=True)[0]
+                if grad is None:
+                    return torch.zeros_like(u)
+
+                laplacian = torch.zeros_like(u)
+                for i in range(coords.shape[1]):  # 3D coordinates
+                    grad_i = torch.autograd.grad(outputs=grad[:, i].sum(), inputs=coords,
+                                                 create_graph=True, retain_graph=True, allow_unused=True)[0]
+                    if grad_i is not None:
+                        laplacian += grad_i[:, i]
+                return laplacian
+
+            # 실수부와 허수부의 Laplacian 계산
+            lap_p_real = compute_laplacian(p_real, coords_int_full)
+            lap_p_imag = compute_laplacian(p_imag, coords_int_full)
+
+            # 복소수 Laplacian 재구성
+            lap_p = torch.complex(lap_p_real, lap_p_imag)
+
+            # Helmholtz 방정식 잔차
             pde_residual = lap_p + (k**2) * p_val
-            loss_pde = complex_mse_loss(pde_residual, torch.zeros_like(pde_residual))
+            loss_pde = complex_mse_loss(pde_residual / k, torch.zeros_like(pde_residual)) 
 
             # 3-4. 지역별 손실 및 목표 지점 손실 (Region-Specific & Target-Point Losses)
-            region_mask = get_region_mask(coords_int_full.detach(), **region_params)
+            region_mask_params = {
+                'target_center': region_params['target_center'],
+                'target_radius': region_params['target_radius'],
+                'boundary_range': region_params['boundary_tol'],
+                'xy_range': region_params['xy_range'],
+                'z_range': region_params['z_range']
+            }
+            region_mask = get_region_mask(coords_int_full.detach(), **region_mask_params)
             
             # 목표 지점 압력 극대화
             t_coord = torch.tensor(target_coord, dtype=torch.float32, device=device).unsqueeze(0)
@@ -919,15 +1069,16 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
             # --- 4. 최종 손실 결합 및 역전파 ---
             total_loss = (
                 loss_data +
-                w_pde * loss_pde +
-                w_bc * loss_bc +
-                w_target * loss_target +
+                w_pde_current * loss_pde +      # warm-up 적용
+                w_bc_current * loss_bc +        # warm-up 적용
+                w_target_current * loss_target + # warm-up 적용
                 w_target_region * loss_target_region +
                 w_boundary_region * loss_boundary_region +
                 w_background_region * loss_background_region
             )
             
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # gradient clipping
             optimizer.step()
             epoch_total_loss += total_loss.item()
         
@@ -938,6 +1089,8 @@ def train_model(model, train_loader, device, y_mean, y_std, target_coord, cfg, r
         
         if epoch % 100 == 0 or epoch == epochs - 1:
             print(f"[Epoch {epoch:04d}] Avg Loss: {avg_epoch_loss:.4e} | PDE: {loss_pde.item():.3e} | BC: {loss_bc.item():.3e} | Data: {loss_data.item():.3e}")
+            if epoch < 500:
+                print(f"  └─ Warm-up: PDE weight={w_pde_current:.3f}, BC weight={w_bc_current:.3f}")
             if agent:
                 print(f"  └─ RL Op Config: {model.decoder.region_operator_config}")
 
@@ -1111,35 +1264,66 @@ def main(args):
         plt.yscale('log'); plt.title('Training loss')
         plt.savefig(os.path.join(cfg.get('logdir','./logs'), "loss_curve.png"))
         plt.show()
-
+        
+        print("Plotting pressure field...")
+        plot_pressure_field_2d(
+            model, 
+            test_data[0] if isinstance(test_data, list) else test_data,
+            device,
+            y_slice=0.0,
+            save_path=os.path.join(cfg.get('logdir','./logs'), 'pressure_field_xz.png')
+        )
+        
     # 5. 테스트 및 시각화 (args.test 플래그가 True일 때만 실행)
     if args.test:
         print('Evaluating test data and visualizing...')
         load_model(model, os.path.join(cfg.get('logdir','./logs'), 'best_model.pt'), device)
         model.eval()
-        
+
         test_sample = next(iter(test_loader))
         mean_pred, std_pred = predict_mc_dropout(model, test_sample, n_samples=cfg['n_mc'], device=device)
-        
+
         coords, X, Y, Z = sample_query_points_3d(grid_size=cfg['grid_size_test'])
-        
+
+        # 차원 확인 및 조정
+        if mean_pred.shape[1] == 4:  # 복소수 4차원인 경우
+            # 복소수를 실수로 확장했다고 가정
+            mean_pred_real = np.zeros((mean_pred.shape[0], 8))
+            mean_pred_real[:, :4] = mean_pred  # 실수부
+            mean_pred_real[:, 4:] = 0  # 허수부는 0으로 (또는 다른 처리)
+            mean_pred = mean_pred_real
+
+            std_pred_real = np.zeros((std_pred.shape[0], 8))
+            std_pred_real[:, :4] = std_pred
+            std_pred_real[:, 4:] = 0
+            std_pred = std_pred_real
+
         mean_pred_denorm = mean_pred * y_std + y_mean
         std_pred_denorm = std_pred * y_std
 
         p_real, p_imag = mean_pred_denorm[:,0], mean_pred_denorm[:,1]
         vx_r, vy_r, vz_r = mean_pred_denorm[:,2], mean_pred_denorm[:,3], mean_pred_denorm[:,4]
         vx_i, vy_i, vz_i = mean_pred_denorm[:,5], mean_pred_denorm[:,6], mean_pred_denorm[:,7]
-        
+
         U_mean = gorkov_potential_torch_3d(
             torch.from_numpy(p_real), torch.from_numpy(p_imag), torch.from_numpy(vx_r),
             torch.from_numpy(vy_r), torch.from_numpy(vz_r), torch.from_numpy(vx_i),
             torch.from_numpy(vy_i), torch.from_numpy(vz_i)
         ).numpy().reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
-        
+
         p_std = np.sqrt(std_pred_denorm[:,0]**2 + std_pred_denorm[:,1]**2)
         U_std_reshaped = p_std.reshape(cfg['grid_size_test'],cfg['grid_size_test'],cfg['grid_size_test'])
 
         plot_field_gorkov_3d(U_mean, U_std_reshaped, X, Y, Z, z_idx=cfg['grid_size_test']//2, savedir=cfg.get('logdir','./logs'))
+        
+        print("Plotting pressure field...")
+        plot_pressure_field_2d(
+            model, 
+            test_data[0] if isinstance(test_data, list) else test_data,
+            device,
+            y_slice=0.0,
+            save_path=os.path.join(cfg.get('logdir','./logs'), 'pressure_field_xz_test.png')
+        )
     
     # Forward pass 테스트는 학습/테스트 전에 실행되도록 이동
     print("\nMain function completed.")
